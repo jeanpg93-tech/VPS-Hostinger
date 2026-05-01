@@ -22,6 +22,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 RENDER_DIR = Path("/tmp/renders")
 RENDER_DIR.mkdir(exist_ok=True)
+FPS = 30
 
 # Track jobs
 jobs: dict[str, dict] = {}
@@ -101,6 +102,11 @@ async def process_render(
         bg_music_url = settings.get("bgMusicUrl")
         bg_music_volume = settings.get("bgMusicVolume", 0.15)
         narration_volume = settings.get("narrationVolume", 1.0)
+        transition_style = settings.get("transitionStyle") or settings.get("transition") or "none"
+        transition_duration = float(settings.get("transitionDuration") or 0)
+        ken_burns_style = settings.get("kenBurnsStyle", "dynamic")
+        color_grading = settings.get("colorGrading", "none")
+        enable_vignette = bool(settings.get("enableVignette") or settings.get("vignette"))
 
         # Parse aspect ratio
         if aspect == "9:16":
@@ -112,11 +118,12 @@ async def process_render(
 
         # Download all scene assets
         scene_clips = []
+        scene_durations = []
         for i, scene in enumerate(sorted(scenes, key=lambda s: s.get("scene_order", 0))):
             scene_dir = work_dir / f"scene_{i}"
             scene_dir.mkdir(exist_ok=True)
 
-            duration = scene.get("estimated_duration", 5)
+            duration = float(scene.get("scene_duration_seconds") or scene.get("estimated_duration") or 5)
             image_url = scene.get("image_url")
             audio_url = scene.get("audio_url")
             video_url = scene.get("stock_video_url")
@@ -161,6 +168,7 @@ async def process_render(
                 cmd = build_image_scene_cmd(
                     image_path, audio_path, scene_output,
                     width, height, duration, narration_volume, media_type,
+                    ken_burns_style, color_grading, enable_vignette, i,
                     text if caption_style != "none" else None, caption_style
                 )
             else:
@@ -181,19 +189,17 @@ async def process_render(
                 raise RuntimeError(f"FFmpeg failed on scene {i}")
 
             scene_clips.append(scene_output)
-
-        # Concatenate all scene clips
-        concat_list = work_dir / "concat.txt"
-        with open(concat_list, "w") as f:
-            for clip in scene_clips:
-                f.write(f"file '{clip}'\n")
+            scene_durations.append(duration)
 
         concat_output = work_dir / "concat.mp4"
-        concat_cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy", str(concat_output)
-        ]
+        concat_cmd = build_concat_cmd(
+            scene_clips,
+            scene_durations,
+            concat_output,
+            work_dir,
+            transition_style,
+            transition_duration,
+        )
         proc = await asyncio.create_subprocess_exec(
             *concat_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
@@ -309,34 +315,96 @@ def get_caption_filter(text: str, style: str, width: int, height: int) -> str:
         )
 
 
+def color_grading_filter(grading: str) -> str:
+    grading = (grading or "none").lower()
+    if grading == "cinematic_warm":
+        return "eq=contrast=1.08:saturation=1.10,colorbalance=rs=0.15:gs=0.05:bs=-0.10"
+    if grading == "cinematic_cold":
+        return "eq=contrast=1.05:saturation=0.95,colorbalance=rs=-0.10:gs=0.02:bs=0.18"
+    if grading == "vintage":
+        return "eq=contrast=0.92:saturation=0.75:gamma=1.05,colorbalance=rs=0.08:gs=0.04:bs=-0.15"
+    if grading == "noir":
+        return "hue=s=0,eq=contrast=1.35:brightness=-0.04"
+    return ""
+
+
+def vignette_filter(enabled: bool) -> str:
+    return "vignette=PI/4" if enabled else ""
+
+
+def ken_burns_filter(style: str, scene_index: int, duration: float, w: int, h: int) -> str:
+    style = (style or "dynamic").lower()
+    if style == "dynamic":
+        style = "zoom_in" if scene_index % 2 == 0 else "zoom_out"
+
+    frames = max(1, int(round(duration * FPS)))
+    if style == "zoom_out":
+        zoom_expr = "if(eq(on,0),1.25,max(zoom-0.0010,1.00))"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+    elif style == "pan_horizontal":
+        zoom_expr = "1.18"
+        x_expr = "if(eq(on,0),0,min(x+1,iw-iw/zoom))"
+        y_expr = "ih/2-(ih/zoom/2)"
+    else:
+        zoom_expr = "min(zoom+0.0010,1.25)"
+        x_expr = "iw/2-(iw/zoom/2)"
+        y_expr = "ih/2-(ih/zoom/2)"
+
+    return f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={w}x{h}:fps={FPS}"
+
+
+def compose_video_filter(
+    base_filter: str,
+    text: str | None,
+    caption_style: str,
+    w: int,
+    h: int,
+    color_grading: str = "none",
+    enable_vignette: bool = False,
+) -> str:
+    parts = [base_filter]
+    grading = color_grading_filter(color_grading)
+    if grading:
+        parts.append(grading)
+    vignette = vignette_filter(enable_vignette)
+    if vignette:
+        parts.append(vignette)
+    if text:
+        parts.append(get_caption_filter(text, caption_style, w, h))
+    return ",".join(parts)
+
+
 def build_image_scene_cmd(
     image: Path, audio: Path | None, output: Path,
     w: int, h: int, duration: float, narr_vol: float,
-    media_type: str, text: str | None = None, caption_style: str = "default"
+    media_type: str, ken_burns_style: str = "dynamic",
+    color_grading: str = "none", enable_vignette: bool = False,
+    scene_index: int = 0, text: str | None = None, caption_style: str = "default"
 ) -> list[str]:
     """Build FFmpeg command for an image-based scene."""
     # Ken burns: slow zoom effect
     if media_type == "ken_burns":
-        vf = f"zoompan=z='min(zoom+0.001,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={int(duration*25)}:s={w}x{h}:fps=25"
+        base_vf = ken_burns_filter(ken_burns_style, scene_index, duration, w, h)
     else:
-        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        base_vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}"
 
-    if text:
-        vf += f",{get_caption_filter(text, caption_style, w, h)}"
-
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", str(image)]
+    vf = compose_video_filter(base_vf, text, caption_style, w, h, color_grading, enable_vignette)
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-t", str(duration), "-i", str(image)]
 
     if audio:
         cmd += ["-i", str(audio)]
         cmd += ["-filter_complex", f"[0:v]{vf}[v];[1:a]volume={narr_vol}[a]"]
         cmd += ["-map", "[v]", "-map", "[a]"]
     else:
-        cmd += ["-vf", vf]
+        cmd += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+        cmd += ["-filter_complex", f"[0:v]{vf}[v];[1:a]volume=0[a]"]
+        cmd += ["-map", "[v]", "-map", "[a]"]
 
     cmd += [
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS), "-shortest",
         str(output)
     ]
     return cmd
@@ -348,9 +416,8 @@ def build_video_scene_cmd(
     text: str | None = None, caption_style: str = "default"
 ) -> list[str]:
     """Build FFmpeg command for a stock-video-based scene."""
-    vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
-    if text:
-        vf += f",{get_caption_filter(text, caption_style, w, h)}"
+    base_vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}"
+    vf = compose_video_filter(base_vf, text, caption_style, w, h)
 
     cmd = ["ffmpeg", "-y", "-i", str(video)]
 
@@ -359,12 +426,14 @@ def build_video_scene_cmd(
         cmd += ["-filter_complex", f"[0:v]{vf}[v];[1:a]volume={narr_vol}[a]"]
         cmd += ["-map", "[v]", "-map", "[a]", "-ignore_unknown"]
     else:
-        cmd += ["-vf", vf]
+        cmd += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+        cmd += ["-filter_complex", f"[0:v]{vf}[v];[1:a]volume=0[a]"]
+        cmd += ["-map", "[v]", "-map", "[a]", "-ignore_unknown"]
 
     cmd += [
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS), "-shortest",
         str(output)
     ]
     return cmd
@@ -376,7 +445,7 @@ def build_black_scene_cmd(
     text: str | None = None, caption_style: str = "default"
 ) -> list[str]:
     """Build FFmpeg command for a black screen scene (no image/video)."""
-    vf = f"color=c=black:s={w}x{h}:d={duration}"
+    vf = f"color=c=black:s={w}x{h}:r={FPS}:d={duration}"
     if text:
         vf_text = get_caption_filter(text, caption_style, w, h)
         vf = f"{vf},{vf_text}"
@@ -387,12 +456,84 @@ def build_black_scene_cmd(
         cmd += ["-i", str(audio)]
         cmd += ["-filter_complex", f"[1:a]volume={narr_vol}[a]"]
         cmd += ["-map", "0:v", "-map", "[a]"]
+    else:
+        cmd += ["-f", "lavfi", "-t", str(duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+        cmd += ["-filter_complex", "[1:a]volume=0[a]"]
+        cmd += ["-map", "0:v", "-map", "[a]"]
 
     cmd += [
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-        "-c:a", "aac", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS), "-shortest",
         str(output)
+    ]
+    return cmd
+
+
+def build_concat_cmd(
+    clips: list[Path],
+    durations: list[float],
+    output: Path,
+    work_dir: Path,
+    transition_style: str,
+    transition_duration: float,
+) -> list[str]:
+    if len(clips) == 1:
+        return [
+            "ffmpeg", "-y", "-i", str(clips[0]),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS),
+            str(output),
+        ]
+
+    style = (transition_style or "none").lower()
+    if style in ("none", "cut") or transition_duration <= 0:
+        concat_list = work_dir / "concat.txt"
+        with open(concat_list, "w") as f:
+            for clip in clips:
+                f.write(f"file '{clip}'\n")
+        return [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+            "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS),
+            str(output),
+        ]
+
+    transition = "fade" if style in ("fade", "crossfade") else style
+    pair_limit = min([d / 3 for d in durations if d > 0] or [0])
+    d = max(0.05, min(float(transition_duration), pair_limit))
+    if d <= 0.05:
+        return build_concat_cmd(clips, durations, output, work_dir, "none", 0)
+
+    cmd = ["ffmpeg", "-y"]
+    for clip in clips:
+        cmd += ["-i", str(clip)]
+
+    filters = []
+    for i in range(len(clips)):
+        filters.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS[v{i}]")
+        filters.append(f"[{i}:a]asetpts=PTS-STARTPTS[a{i}]")
+
+    prev_v = "v0"
+    prev_a = "a0"
+    accumulated = durations[0]
+    for i in range(1, len(clips)):
+        offset = max(0, accumulated - d)
+        out_v = f"xv{i}"
+        out_a = f"xa{i}"
+        filters.append(f"[{prev_v}][v{i}]xfade=transition={transition}:duration={d}:offset={offset}[{out_v}]")
+        filters.append(f"[{prev_a}][a{i}]acrossfade=d={d}:c1=tri:c2=tri[{out_a}]")
+        prev_v = out_v
+        prev_a = out_a
+        accumulated += durations[i] - d
+
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", f"[{prev_v}]", "-map", f"[{prev_a}]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-pix_fmt", "yuv420p", "-r", str(FPS),
+        str(output),
     ]
     return cmd
 
