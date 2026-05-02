@@ -10,6 +10,9 @@ import asyncio
 import subprocess
 import tempfile
 import traceback
+import base64
+import shutil
+import sys
 from pathlib import Path
 
 import httpx
@@ -30,7 +33,44 @@ jobs: dict[str, dict] = {}
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "engine": "ffmpeg"}
+    return {"status": "ok", "engine": "ffmpeg", "tts": "edge-tts"}
+
+
+@app.post("/tts")
+async def tts(request: Request):
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    voice = normalize_tts_voice(body.get("voice"))
+    provider = (body.get("provider") or "auto").lower()
+
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > 6000:
+        return JSONResponse({"error": "text is too long for one TTS request"}, status_code=400)
+
+    job_id = str(uuid.uuid4())
+    work_dir = RENDER_DIR / f"tts_{job_id}"
+    work_dir.mkdir(exist_ok=True)
+
+    try:
+        if provider in ("auto", "edge", "edge-tts", "local"):
+            audio_path = work_dir / "speech.mp3"
+            await synthesize_edge_tts(text, voice, audio_path)
+            duration = await probe_duration(audio_path)
+            return {
+                "success": True,
+                "providerUsed": "edge-tts",
+                "voice": voice,
+                "mimeType": "audio/mpeg",
+                "audioBase64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+                "durationSeconds": duration,
+            }
+
+        return JSONResponse({"error": f"Unsupported TTS provider: {provider}"}, status_code=400)
+    except Exception as e:
+        print(f"TTS failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
 
 @app.get("/status/{job_id}")
@@ -77,6 +117,64 @@ async def download_file(url: str, dest: Path) -> bool:
     except Exception as e:
         print(f"Failed to download {url}: {e}")
         return False
+
+
+def normalize_tts_voice(voice: str | None) -> str:
+    voice = voice or "pt-BR-FranciscaNeural"
+    aliases = {
+        "default": "pt-BR-FranciscaNeural",
+        "female": "pt-BR-FranciscaNeural",
+        "feminina": "pt-BR-FranciscaNeural",
+        "male": "pt-BR-AntonioNeural",
+        "masculina": "pt-BR-AntonioNeural",
+        "francisca": "pt-BR-FranciscaNeural",
+        "antonio": "pt-BR-AntonioNeural",
+    }
+    return aliases.get(voice.lower(), voice)
+
+
+async def synthesize_edge_tts(text: str, voice: str, output_path: Path):
+    cmd = [
+        sys.executable,
+        "-m",
+        "edge_tts",
+        "--voice",
+        voice,
+        "--text",
+        text,
+        "--write-media",
+        str(output_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="ignore")[-500:] or "edge-tts failed")
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("edge-tts did not create audio")
+
+
+async def probe_duration(path: Path) -> float | None:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        ffprobe,
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    try:
+        return round(float(stdout.decode().strip()), 2)
+    except Exception:
+        return None
 
 
 async def process_render(
