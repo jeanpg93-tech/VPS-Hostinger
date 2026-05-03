@@ -524,7 +524,10 @@ def build_video_scene_cmd(
     base_vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={FPS}"
     vf = compose_video_filter(base_vf, text, caption_style, w, h)
 
-    cmd = ["ffmpeg", "-y", "-i", str(video)]
+    # Stock clips are often shorter than the narration. Loop the video input so
+    # the scene duration is controlled by the measured narration/scene length,
+    # not by the source clip length.
+    cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(video)]
 
     if audio:
         cmd += ["-i", str(audio)]
