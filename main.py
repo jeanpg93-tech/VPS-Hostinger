@@ -81,6 +81,11 @@ async def get_status(job_id: str):
     return job
 
 
+@app.get("/render-status/{job_id}")
+async def get_render_status(job_id: str):
+    return await get_status(job_id)
+
+
 @app.post("/render-video")
 async def render_video(request: Request):
     body = await request.json()
@@ -598,7 +603,7 @@ def build_concat_cmd(
             str(output),
         ]
 
-    transition = "fade" if style in ("fade", "crossfade") else style
+    transition = normalize_xfade_transition(style)
     pair_limit = min([d / 3 for d in durations if d > 0] or [0])
     d = max(0.05, min(float(transition_duration), pair_limit))
     if d <= 0.05:
@@ -634,6 +639,39 @@ def build_concat_cmd(
         str(output),
     ]
     return cmd
+
+
+def normalize_xfade_transition(style: str) -> str:
+    aliases = {
+        "crossfade": "fade",
+        "fade_black": "fadeblack",
+        "fadeblack": "fadeblack",
+        "fade_white": "fadewhite",
+        "fadewhite": "fadewhite",
+        "slide_left": "slideleft",
+        "slide_right": "slideright",
+        "slide_up": "slideup",
+        "slide_down": "slidedown",
+        "wipe_left": "wipeleft",
+        "wipe_right": "wiperight",
+        "wipe_up": "wipeup",
+        "wipe_down": "wipedown",
+    }
+    normalized = aliases.get((style or "fade").lower(), (style or "fade").lower())
+    supported = {
+        "fade", "wipeleft", "wiperight", "wipeup", "wipedown",
+        "slideleft", "slideright", "slideup", "slidedown",
+        "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite",
+        "radial", "smoothleft", "smoothright", "smoothup", "smoothdown",
+        "circleopen", "circleclose", "vertopen", "vertclose",
+        "horzopen", "horzclose", "dissolve", "pixelize",
+        "diagtl", "diagtr", "diagbl", "diagbr",
+        "hlslice", "hrslice", "vuslice", "vdslice",
+    }
+    if normalized not in supported:
+        print(f"Unsupported xfade transition '{style}', falling back to fade")
+        return "fade"
+    return normalized
 
 
 async def upload_to_supabase(
