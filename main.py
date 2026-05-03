@@ -227,9 +227,11 @@ async def process_render(
             scene_dir.mkdir(exist_ok=True)
 
             duration = float(scene.get("scene_duration_seconds") or scene.get("estimated_duration") or 5)
-            image_url = scene.get("image_url")
+            selected_media_url = scene.get("selected_media_url")
+            selected_media_type = scene.get("selected_media_type")
+            image_url = selected_media_url if selected_media_type == "image" else scene.get("image_url")
             audio_url = scene.get("audio_url")
-            video_url = scene.get("stock_video_url")
+            video_url = selected_media_url if selected_media_type == "video" else scene.get("stock_video_url")
             text = scene.get("text_content", "")
 
             # Download image
