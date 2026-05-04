@@ -111,17 +111,40 @@ async def render_video(request: Request):
     return {"jobId": job_id, "status": "queued"}
 
 
-async def download_file(url: str, dest: Path) -> bool:
-    """Download a file from URL to local path."""
-    try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            dest.write_bytes(resp.content)
-            return True
-    except Exception as e:
-        print(f"Failed to download {url}: {e}")
-        return False
+async def download_file(url: str, dest: Path, attempts: int = 3) -> bool:
+    """Download a file from URL to local path with short retries."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if dest.exists():
+                dest.unlink()
+            async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                if not resp.content:
+                    raise RuntimeError("empty response body")
+                dest.write_bytes(resp.content)
+                if dest.exists() and dest.stat().st_size > 0:
+                    return True
+                raise RuntimeError("downloaded file is empty")
+        except Exception as e:
+            last_error = e
+            print(f"Failed to download {url} (attempt {attempt}/{attempts}): {e}")
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+            if attempt < attempts:
+                await asyncio.sleep(1.5 * attempt)
+    print(f"Download permanently failed for {url}: {last_error}")
+    return False
+
+
+def require_download(path: Path | None, url: str | None, label: str, scene_order: int | str) -> Path:
+    if path and path.exists() and path.stat().st_size > 0:
+        return path
+    raise RuntimeError(f"Scene {scene_order}: required {label} could not be downloaded from {url}")
 
 
 def normalize_tts_voice(voice: str | None) -> str:
@@ -226,9 +249,11 @@ async def process_render(
             scene_dir = work_dir / f"scene_{i}"
             scene_dir.mkdir(exist_ok=True)
 
+            scene_order = scene.get("scene_order", i)
             duration = float(scene.get("scene_duration_seconds") or scene.get("estimated_duration") or 5)
             selected_media_url = scene.get("selected_media_url")
             selected_media_type = scene.get("selected_media_type")
+            is_title_card = bool(scene.get("is_title_card"))
             image_url = selected_media_url if selected_media_type == "image" else scene.get("image_url")
             audio_url = scene.get("audio_url")
             video_url = selected_media_url if selected_media_type == "video" else scene.get("stock_video_url")
@@ -241,6 +266,8 @@ async def process_render(
                 await download_file(image_url, image_path)
                 if not image_path.exists():
                     image_path = None
+                if selected_media_type == "image":
+                    image_path = require_download(image_path, image_url, "image", scene_order)
 
             # Download audio (narration)
             audio_path = None
@@ -249,6 +276,7 @@ async def process_render(
                 await download_file(audio_url, audio_path)
                 if not audio_path.exists():
                     audio_path = None
+                audio_path = require_download(audio_path, audio_url, "audio", scene_order)
 
             # Download stock video
             stock_video_path = None
@@ -257,6 +285,8 @@ async def process_render(
                 await download_file(video_url, stock_video_path)
                 if not stock_video_path.exists():
                     stock_video_path = None
+                if selected_media_type == "video":
+                    stock_video_path = require_download(stock_video_path, video_url, "stock video", scene_order)
 
             # Build scene clip with FFmpeg
             scene_output = scene_dir / "clip.mp4"
@@ -277,6 +307,10 @@ async def process_render(
                     text if caption_style != "none" else None, caption_style
                 )
             else:
+                if selected_media_type in ("image", "video") or not is_title_card:
+                    raise RuntimeError(
+                        f"Scene {scene_order}: no usable media after download; refusing to render black fallback"
+                    )
                 # Black screen with audio
                 cmd = build_black_scene_cmd(
                     audio_path, scene_output,
